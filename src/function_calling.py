@@ -1,20 +1,13 @@
 """
 Motor de Function Calling HÍBRIDO para FitIA — Sistema Unificado.
 
-Este módulo combina:
-  - Function Calling para operaciones de datos (crear usuario, registrar comidas, etc.)
-  - RAG (Retrieval-Augmented Generation) para preguntas de conocimiento sobre nutrición/fitness
-  - Detección automática de modo: el LLM decide cuándo usar herramientas vs conocimiento.
+Combina Function Calling (datos del usuario) y RAG (conocimiento de nutrición/fitness).
+El LLM decide automáticamente cuándo usar herramientas vs conocimiento de documentos.
 
 Flujo por turno:
   1. El mensaje llega al LLM con las herramientas disponibles.
   2. Si el LLM llama una función → se ejecuta localmente y se devuelve el resultado.
-  3. Si el LLM responde con texto → se devuelve directamente (puede ser RAG si el contexto
-     de documentos fue inyectado en el system prompt, o conocimiento general del modelo).
-
-El error previo ("No tengo información sobre crear perfil...") se corregía porque
-el sistema RAG buscaba en documentos PDF la respuesta a acciones del usuario,
-en lugar de usar function calling. Ahora el mismo agente maneja ambos casos.
+  3. Si el LLM responde con texto → puede usar contexto RAG inyectado en el system prompt.
 """
 
 import json
@@ -27,6 +20,7 @@ import os
 from src.functions import (
     crear_usuario,
     obtener_perfil,
+    buscar_usuario_por_nombre,
     registrar_comida,
     consultar_calorias_hoy,
     eliminar_ultima_comida,
@@ -46,11 +40,12 @@ if not GROQ_API_KEY:
 client = Groq(api_key=GROQ_API_KEY)
 
 # ---------------------------------------------------------------------------
-# Mapa de funciones disponibles — el dispatcher las busca aquí por nombre
+# Mapa de funciones — el dispatcher las busca aquí por nombre
 # ---------------------------------------------------------------------------
 FUNCTIONS_MAP: dict[str, Callable] = {
     "crear_usuario": crear_usuario,
     "obtener_perfil": obtener_perfil,
+    "buscar_usuario_por_nombre": buscar_usuario_por_nombre,
     "registrar_comida": registrar_comida,
     "consultar_calorias_hoy": consultar_calorias_hoy,
     "eliminar_ultima_comida": eliminar_ultima_comida,
@@ -70,18 +65,18 @@ TOOLS: list[dict] = [
         "function": {
             "name": "crear_usuario",
             "description": (
-                "Registra un nuevo perfil de usuario en el sistema FitIA. "
-                "SIEMPRE usar esta función cuando el usuario quiera: crear su perfil, "
-                "registrarse, empezar a usar FitIA, o cuando diga 'quiero crear un usuario/perfil'. "
-                "Pedir nombre, edad, peso, altura y objetivo si no los proporcionó."
+                "Registra un nuevo perfil de usuario en FitIA. "
+                "Usar cuando el usuario quiera crear su perfil o registrarse. "
+                "Pedir nombre, edad, peso, altura y objetivo si no los proporcionó. "
+                "NUNCA inventar estos datos."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "nombre":    {"type": "string",  "description": "Nombre completo del usuario."},
-                    "edad":      {"type": "integer", "description": "Edad en años."},
-                    "peso_kg":   {"type": "number",  "description": "Peso actual en kilogramos."},
-                    "altura_cm": {"type": "number",  "description": "Altura en centímetros."},
+                    "edad":      {"type": "integer", "description": "Edad en años. DEBE ser un número entero real proporcionado por el usuario. NO llamar si no se tiene este valor."},
+                    "peso_kg":   {"type": "number",  "description": "Peso actual en kilogramos. DEBE ser un número real proporcionado por el usuario. NO llamar si no se tiene este valor."},
+                    "altura_cm": {"type": "number",  "description": "Altura en centímetros. DEBE ser un número real proporcionado por el usuario. NO llamar si no se tiene este valor."},
                     "objetivo":  {"type": "string",  "description": "Meta: 'bajar peso', 'subir peso', 'mantener peso', 'ganar músculo' o 'mejorar resistencia'."}
                 },
                 "required": ["nombre", "edad", "peso_kg", "altura_cm", "objetivo"]
@@ -92,7 +87,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "obtener_perfil",
-            "description": "Consulta el perfil completo de un usuario: nombre, edad, peso, altura y objetivo.",
+            "description": "Consulta el perfil completo de un usuario por su ID numérico.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -105,8 +100,34 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "buscar_usuario_por_nombre",
+            "description": (
+                "Busca un usuario registrado por su nombre y devuelve su ID. "
+                "USAR SIEMPRE cuando el usuario mencione su nombre pero no su ID. "
+                "Esto permite identificarlo antes de registrar comidas, ejercicios o consultar datos. "
+                "Si no recuerda su ID, busca por nombre primero. "
+                "IMPORTANTE: Si la función devuelve más de un usuario, "
+                "SIEMPRE pregunta al usuario cuál es el suyo antes de continuar con cualquier otra acción."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nombre": {"type": "string", "description": "Nombre o parte del nombre a buscar."}
+                },
+                "required": ["nombre"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "registrar_comida",
-            "description": "Registra un alimento consumido en el log del día. Usar cuando el usuario diga que comió algo.",
+            "description": (
+                "Registra un alimento consumido en el log del día. Usar cuando el usuario diga que comió algo. "
+                "Si el usuario menciona varios alimentos en un mismo mensaje, llama esta función una vez por cada alimento. "
+                "Los macros (proteínas, carbohidratos, grasas) son opcionales — si el usuario no los dio, usar 0. "
+                "NUNCA pedir macros al usuario si no los proporcionó."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -114,9 +135,9 @@ TOOLS: list[dict] = [
                     "alimento":        {"type": "string",  "description": "Nombre del alimento."},
                     "cantidad_g":      {"type": "number",  "description": "Cantidad en gramos."},
                     "calorias":        {"type": "number",  "description": "Calorías totales de esa porción."},
-                    "proteinas_g":     {"type": "number",  "description": "Gramos de proteína. Usar 0 si no se sabe."},
-                    "carbohidratos_g": {"type": "number",  "description": "Gramos de carbohidratos. Usar 0 si no se sabe."},
-                    "grasas_g":        {"type": "number",  "description": "Gramos de grasa. Usar 0 si no se sabe."}
+                    "proteinas_g":     {"type": "number", "description": "Gramos de proteína. OPCIONAL — usar 0 si el usuario no lo mencionó. NUNCA preguntar al usuario por este dato."},
+                    "carbohidratos_g": {"type": "number", "description": "Gramos de carbohidratos. OPCIONAL — usar 0 si el usuario no lo mencionó. NUNCA preguntar al usuario por este dato."},
+                    "grasas_g":        {"type": "number", "description": "Gramos de grasa. OPCIONAL — usar 0 si el usuario no lo mencionó. NUNCA preguntar al usuario por este dato."}
                 },
                 "required": ["usuario_id", "alimento", "cantidad_g", "calorias"]
             }
@@ -235,9 +256,6 @@ def _build_system_prompt(rag_context: Optional[str] = None) -> str:
     """
     Construye el system prompt dinámico del agente híbrido.
 
-    Si se inyecta contexto RAG, lo incluye para responder preguntas de conocimiento.
-    El prompt deja muy claro al LLM cuándo usar herramientas vs conocimiento.
-
     Args:
         rag_context: Texto de contexto recuperado de ChromaDB, o None.
 
@@ -247,31 +265,39 @@ def _build_system_prompt(rag_context: Optional[str] = None) -> str:
     base = """Eres FitIA, una asistente experta en nutrición, fitness y bienestar con acceso a herramientas para gestionar datos del usuario.
 
 REGLAS CRÍTICAS:
-1. HERRAMIENTAS: Usa las herramientas (funciones) cuando el usuario quiera:
-   - Crear o consultar su perfil (crear_usuario, obtener_perfil)
+1. IDENTIFICACIÓN OBLIGATORIA: Antes de registrar comidas, ejercicios, consultar datos o calcular balances,
+   DEBES saber el ID del usuario. Si el usuario dice su nombre pero no su ID, usa buscar_usuario_por_nombre
+   primero. Si no está registrado, usa crear_usuario. NUNCA asumas un ID.
+
+2. DATOS FALTANTES: NUNCA llames una función si algún parámetro requerido no fue proporcionado
+   explícitamente por el usuario. Si faltan datos, PREGUNTA primero y espera la respuesta.
+   PROHIBIDO pasar strings como "desconocido", "valor desconocido" o similares — eso causará un error.
+   Solo llama la función cuando tengas TODOS los valores reales del usuario.
+
+3. HERRAMIENTAS: Usa las herramientas cuando el usuario quiera:
+   - Crear o consultar su perfil (crear_usuario, obtener_perfil, buscar_usuario_por_nombre)
    - Registrar comidas o ejercicios (registrar_comida, registrar_ejercicio)
-   - Ver su progreso del día (consultar_calorias_hoy, consultar_ejercicios_hoy)
-   - Calcular balance calórico (calcular_balance_calorico)
+   - Ver su progreso (consultar_calorias_hoy, consultar_ejercicios_hoy, calcular_balance_calorico)
    - Ver historial o guardar planes (consultar_historial, guardar_plan_semanal)
 
-2. DATOS FALTANTES: Si el usuario pide crear perfil o registrar algo pero no te dio todos los datos requeridos, PÍDELOS antes de llamar la función. NUNCA inventes datos.
-
-3. ID DE USUARIO: Si el usuario no ha mencionado su ID y necesitas uno, pregúntaselo amablemente. No asumas el ID 1 ni ningún otro.
-
-4. PREGUNTAS DE CONOCIMIENTO: Para preguntas sobre nutrición, dietas, ejercicios, salud general (sin necesidad de guardar datos), responde con tu conocimiento experto."""
+4. PREGUNTAS DE CONOCIMIENTO: Para preguntas sobre nutrición, dietas, ejercicio o bienestar,
+   responde ÚNICAMENTE con la información del CONTEXTO DE DOCUMENTOS que se te proporciona abajo.
+   Si la información no está en ese contexto, responde exactamente:
+   "Hmm, no tengo información sobre eso en mi base de conocimiento. ¿Tienes otra duda sobre 
+   nutrición, ejercicio o bienestar?"
+   NUNCA respondas preguntas fuera del dominio fitness/nutrición (historia, deportes, política, etc.)."""
 
     if rag_context:
         base += f"""
 
-CONTEXTO DE DOCUMENTOS ESPECIALIZADOS (úsalo para respuestas de conocimiento):
+⚠️ CONTEXTO OBLIGATORIO — USA SOLO ESTO PARA RESPONDER PREGUNTAS DE CONOCIMIENTO:
 {rag_context}
 
-Si la respuesta está en el contexto de arriba, úsalo. Si no está, usa tu conocimiento general de nutrición y fitness."""
+Si la respuesta no está en este contexto, admite que no tienes esa información. NUNCA uses conocimiento externo."""
     else:
-        base += "\n\nResponde con tu conocimiento experto en nutrición y fitness cuando no se necesiten herramientas."
+        base += "\n\nResponde con tu conocimiento experto cuando no se necesiten herramientas."
 
-    base += "\n\nSé conciso, motivador y claro. Usa un tono amigable como entrenador de confianza."
-
+    base += "\n\nSé conciso, motivador y claro. Tono amigable como entrenador de confianza."
     return base
 
 
@@ -302,16 +328,11 @@ def create_hybrid_agent(db: Optional[Chroma] = None) -> Callable[[str], str]:
     """
     Crea el agente híbrido FitIA que combina Function Calling y RAG.
 
-    Si se pasa una instancia de ChromaDB, el agente recuperará contexto de documentos
-    para enriquecer las respuestas de conocimiento sobre nutrición y fitness.
-    Si no se pasa db, funciona en modo function-calling puro.
-
     Args:
         db (Optional[Chroma]): Base de datos vectorial con documentos de fitness/nutrición.
-                               Puede ser None para modo sin RAG.
 
     Returns:
-        Callable[[str], str]: Función `chat(message)` que procesa mensajes del usuario.
+        Callable[[str], str]: Función chat(message) que procesa mensajes del usuario.
     """
     historial: list[dict] = []
 
@@ -321,8 +342,8 @@ def create_hybrid_agent(db: Optional[Chroma] = None) -> Callable[[str], str]:
 
         Flujo:
           1. Si hay db RAG, busca contexto relevante en los documentos.
-          2. Construye el system prompt (con o sin contexto RAG).
-          3. Llama al LLM con las herramientas disponibles.
+          2. Construye el system prompt dinámico.
+          3. Llama al LLM con herramientas disponibles.
           4. Si hay tool_calls → ejecuta funciones → segunda llamada al LLM.
           5. Devuelve respuesta final en lenguaje natural.
 
@@ -343,8 +364,7 @@ def create_hybrid_agent(db: Optional[Chroma] = None) -> Callable[[str], str]:
                 if docs:
                     rag_context = "\n\n".join([doc.page_content for doc in docs])
             except Exception:
-                # Si falla el RAG, continuar sin contexto (no bloquear al usuario)
-                rag_context = None
+                rag_context = None  # RAG falla en silencio, no bloquear al usuario
 
         # --- Paso 2: Construir system prompt dinámico ---
         system_prompt = _build_system_prompt(rag_context)
@@ -361,8 +381,21 @@ def create_hybrid_agent(db: Optional[Chroma] = None) -> Callable[[str], str]:
                 max_tokens=1024,
             )
         except Exception as e:
-            historial.pop()  # Revertir para no contaminar el historial
-            return f"Error al contactar el modelo. Verifica tu API key. (Detalle: {e})"
+            error_str = str(e)
+            # Si Groq rechazó el tool_call por JSON malformado, reintentar sin tools
+            if "tool_use_failed" in error_str or "400" in error_str:
+                try:
+                    response = client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[{"role": "system", "content": system_prompt}] + historial,
+                        max_tokens=1024,
+                    )
+                except Exception as e2:
+                    historial.pop()
+                    return f"Error al contactar el modelo. (Detalle: {e2})"
+            else:
+                historial.pop()
+                return f"Error al contactar el modelo. Verifica tu API key. (Detalle: {e})"
 
         msg = response.choices[0].message
 
@@ -373,7 +406,6 @@ def create_hybrid_agent(db: Optional[Chroma] = None) -> Callable[[str], str]:
             return respuesta
 
         # --- Paso 4b: El LLM decidió llamar una o más funciones ---
-        # Serializar tool_calls al historial en formato correcto para Groq
         historial.append({
             "role": "assistant",
             "content": msg.content or "",
@@ -390,7 +422,7 @@ def create_hybrid_agent(db: Optional[Chroma] = None) -> Callable[[str], str]:
             ]
         })
 
-        # Ejecutar cada función y agregar resultados
+        # Ejecutar cada función y agregar resultados al historial
         for tool_call in msg.tool_calls:
             fn_name = tool_call.function.name
             fn_args_raw = tool_call.function.arguments
@@ -398,10 +430,12 @@ def create_hybrid_agent(db: Optional[Chroma] = None) -> Callable[[str], str]:
             print(f"\n🔧 [Function Call] {fn_name}")
             print(f"   Args: {fn_args_raw}")
 
+            # BUG CORREGIDO: manejar JSON inválido sin crashear
             try:
                 fn_args = json.loads(fn_args_raw) if fn_args_raw else {}
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
                 fn_args = {}
+                print(f"   ⚠️  JSON inválido del LLM: {e}. Se usarán args vacíos.")
 
             resultado_str = dispatch_function(fn_name, fn_args)
             print(f"   Resultado: {resultado_str}")
@@ -413,18 +447,19 @@ def create_hybrid_agent(db: Optional[Chroma] = None) -> Callable[[str], str]:
             })
 
         # --- Paso 5: Segunda llamada al LLM con resultados de funciones ---
-        # Reconstruir system prompt (puede incluir contexto RAG actualizado)
         try:
             response2 = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "system", "content": system_prompt}] + historial,
                 tools=TOOLS,
-                tool_choice="none",  # En la segunda llamada NO queremos más tool_calls
+                tool_choice="none",  # No queremos más tool_calls en esta segunda vuelta
                 max_tokens=1024,
             )
             respuesta_final: str = response2.choices[0].message.content or "Listo, acción completada."
         except Exception as e:
-            return f"Las funciones se ejecutaron correctamente, pero hubo un error generando la respuesta final. (Detalle: {e})"
+            # BUG CORREGIDO: devolver mensaje útil sin perder el contexto ya ejecutado
+            respuesta_final = "Las funciones se ejecutaron correctamente, pero hubo un error generando la respuesta. Intenta preguntar de nuevo."
+            print(f"   ⚠️  Error en segunda llamada al LLM: {e}")
 
         historial.append({"role": "assistant", "content": respuesta_final})
         return respuesta_final
@@ -433,11 +468,8 @@ def create_hybrid_agent(db: Optional[Chroma] = None) -> Callable[[str], str]:
 
 
 # ---------------------------------------------------------------------------
-# Mantener compatibilidad con main_fc.py (modo sin RAG)
+# Compatibilidad con modo sin RAG
 # ---------------------------------------------------------------------------
 def create_function_calling_agent() -> Callable[[str], str]:
-    """
-    Crea el agente en modo function-calling puro (sin RAG).
-    Wrapper de compatibilidad para main_fc.py existente.
-    """
+    """Crea el agente en modo function-calling puro (sin RAG)."""
     return create_hybrid_agent(db=None)

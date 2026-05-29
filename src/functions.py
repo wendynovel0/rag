@@ -1,21 +1,18 @@
 """
 Catálogo de funciones locales para el sistema FitIA — Fase 2: Function Calling.
 
-Contiene las 10 funciones que el LLM puede invocar mediante JSON estructurado.
-Cada función está completamente tipada y documentada para que el modelo pueda
-entender cuándo y cómo usarla a partir de sus docstrings y type hints.
-
 Funciones disponibles:
     1.  crear_usuario            — Registrar perfil del usuario
     2.  obtener_perfil           — Consultar datos del usuario
-    3.  registrar_comida         — Agregar alimento al log diario
-    4.  consultar_calorias_hoy   — Ver ingesta calórica del día
-    5.  eliminar_ultima_comida   — Borrar el último alimento registrado
-    6.  registrar_ejercicio      — Agregar ejercicio al log diario
-    7.  consultar_ejercicios_hoy — Ver ejercicios del día
-    8.  calcular_balance_calorico— Calcular diferencia ingesta vs gasto
-    9.  guardar_plan_semanal     — Guardar un plan alimentario o de entrenamiento
-    10. consultar_historial      — Ver resumen de los últimos N días
+    3.  buscar_usuario_por_nombre— Buscar usuario por nombre (NUEVA)
+    4.  registrar_comida         — Agregar alimento al log diario
+    5.  consultar_calorias_hoy   — Ver ingesta calórica del día
+    6.  eliminar_ultima_comida   — Borrar el último alimento registrado
+    7.  registrar_ejercicio      — Agregar ejercicio al log diario
+    8.  consultar_ejercicios_hoy — Ver ejercicios del día
+    9.  calcular_balance_calorico— Calcular diferencia ingesta vs gasto
+    10. guardar_plan_semanal     — Guardar un plan alimentario o de entrenamiento
+    11. consultar_historial      — Ver resumen de los últimos N días
 """
 
 import sqlite3
@@ -38,7 +35,7 @@ def crear_usuario(
     Registra un nuevo usuario con su perfil y objetivo de salud.
 
     Crea el perfil base del usuario en la base de datos. Si ya existe un usuario
-    con el mismo nombre, devuelve un error en lugar de crear un duplicado.
+    con el mismo nombre, devuelve su ID existente en lugar de crear un duplicado.
 
     Args:
         nombre      (str):   Nombre completo del usuario.
@@ -53,9 +50,14 @@ def crear_usuario(
         dict: {"ok": True, "usuario_id": int, "mensaje": str} si fue exitoso.
               {"ok": False, "error": str} si ocurrió un problema.
     """
-    objetivos_validos = {"bajar peso", "subir peso", "mantener peso", "ganar músculo","aumentar músculo", "subir músculo" "mejorar resistencia"}
+    # BUG CORREGIDO: faltaba un espacio entre "subir músculo" y "mejorar resistencia"
+    # en el set original, causando que "subir músculomejorar resistencia" fuera un objetivo válido.
+    objetivos_validos = {
+        "bajar peso", "subir peso", "mantener peso",
+        "ganar músculo", "aumentar músculo", "subir músculo", "mejorar resistencia"
+    }
     if objetivo.lower() not in objetivos_validos:
-        return {"ok": False, "error": f"Objetivo no válido. Opciones: {', '.join(objetivos_validos)}"}
+        return {"ok": False, "error": f"Objetivo no válido. Opciones: {', '.join(sorted(objetivos_validos))}"}
 
     if edad <= 0 or edad > 120:
         return {"ok": False, "error": "La edad debe estar entre 1 y 120 años."}
@@ -66,28 +68,36 @@ def crear_usuario(
     if altura_cm <= 0 or altura_cm > 300:
         return {"ok": False, "error": "La altura debe estar entre 1 y 300 cm."}
 
+    if not nombre.strip():
+        return {"ok": False, "error": "El nombre no puede estar vacío."}
+
     try:
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Verificar duplicado por nombre
+        # Si ya existe, devolver su ID en lugar de error (mejora UX)
         existente = cursor.execute(
-            "SELECT id FROM usuarios WHERE nombre = ?", (nombre,)
+            "SELECT id FROM usuarios WHERE nombre = ?", (nombre.strip(),)
         ).fetchone()
 
         if existente:
             conn.close()
-            return {"ok": False, "error": f"Ya existe un usuario con el nombre '{nombre}'. Usa otro nombre o consulta tu perfil."}
+            return {
+                "ok": False,
+                "usuario_id": existente["id"],
+                "error": f"Ya existe un usuario con el nombre '{nombre}' (ID: {existente['id']}). "
+                         f"Puedes usar ese ID para registrar tus datos."
+            }
 
         cursor.execute(
             "INSERT INTO usuarios (nombre, edad, peso_kg, altura_cm, objetivo) VALUES (?, ?, ?, ?, ?)",
-            (nombre, edad, peso_kg, altura_cm, objetivo.lower())
+            (nombre.strip(), edad, peso_kg, altura_cm, objetivo.lower())
         )
         conn.commit()
         usuario_id = cursor.lastrowid
         conn.close()
 
-        return {"ok": True, "usuario_id": usuario_id, "mensaje": f"Perfil de '{nombre}' creado correctamente."}
+        return {"ok": True, "usuario_id": usuario_id, "mensaje": f"Perfil de '{nombre}' creado correctamente. Tu ID es {usuario_id}, guárdalo para usar el sistema."}
 
     except sqlite3.Error as e:
         return {"ok": False, "error": f"Error de base de datos al crear usuario: {e}"}
@@ -139,7 +149,50 @@ def obtener_perfil(usuario_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 3. REGISTRAR COMIDA
+# 3. BUSCAR USUARIO POR NOMBRE (NUEVA — resuelve el problema de identidad)
+# ---------------------------------------------------------------------------
+
+def buscar_usuario_por_nombre(nombre: str) -> dict:
+    """
+    Busca un usuario registrado por su nombre y devuelve su ID.
+
+    Usar esta función cuando el usuario diga su nombre pero no recuerde su ID.
+    Permite identificar al usuario antes de registrar comidas, ejercicios o
+    consultar su historial. Si hay múltiples usuarios con nombre similar,
+    devuelve todos para que el usuario confirme cuál es.
+
+    Args:
+        nombre (str): Nombre o parte del nombre a buscar.
+
+    Returns:
+        dict: {"ok": True, "usuarios": list[dict]} con los perfiles encontrados.
+              {"ok": False, "error": str} si no se encontró ningún usuario.
+    """
+    if not nombre.strip():
+        return {"ok": False, "error": "El nombre de búsqueda no puede estar vacío."}
+
+    try:
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT id, nombre, objetivo FROM usuarios WHERE nombre LIKE ?",
+            (f"%{nombre.strip()}%",)
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            return {"ok": False, "error": f"No se encontró ningún usuario con el nombre '{nombre}'. ¿Quieres crear un perfil nuevo?"}
+
+        return {
+            "ok": True,
+            "usuarios": [{"id": r["id"], "nombre": r["nombre"], "objetivo": r["objetivo"]} for r in rows]
+        }
+
+    except sqlite3.Error as e:
+        return {"ok": False, "error": f"Error de base de datos al buscar usuario: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# 4. REGISTRAR COMIDA
 # ---------------------------------------------------------------------------
 
 def registrar_comida(
@@ -180,10 +233,13 @@ def registrar_comida(
     if not alimento.strip():
         return {"ok": False, "error": "El nombre del alimento no puede estar vacío."}
 
+    # BUG CORREGIDO: validar también macros negativos
+    if any(v < 0 for v in [proteinas_g, carbohidratos_g, grasas_g]):
+        return {"ok": False, "error": "Los macronutrientes no pueden ser negativos."}
+
     try:
         conn = get_connection()
 
-        # Verificar que el usuario existe
         usuario = conn.execute("SELECT id FROM usuarios WHERE id = ?", (usuario_id,)).fetchone()
         if not usuario:
             conn.close()
@@ -210,15 +266,12 @@ def registrar_comida(
 
 
 # ---------------------------------------------------------------------------
-# 4. CONSULTAR CALORÍAS HOY
+# 5. CONSULTAR CALORÍAS HOY
 # ---------------------------------------------------------------------------
 
 def consultar_calorias_hoy(usuario_id: int) -> dict:
     """
     Devuelve el resumen de calorías e ingesta nutricional del día actual del usuario.
-
-    Suma todas las comidas registradas hoy y las devuelve con el desglose
-    por macronutrientes (proteínas, carbohidratos, grasas).
 
     Args:
         usuario_id (int): ID del usuario a consultar.
@@ -271,15 +324,12 @@ def consultar_calorias_hoy(usuario_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 5. ELIMINAR ÚLTIMA COMIDA
+# 6. ELIMINAR ÚLTIMA COMIDA
 # ---------------------------------------------------------------------------
 
 def eliminar_ultima_comida(usuario_id: int) -> dict:
     """
     Elimina el registro de la última comida ingresada por el usuario hoy.
-
-    Útil cuando el usuario se equivocó al registrar un alimento. Solo elimina
-    el registro más reciente del día actual, no afecta días anteriores.
 
     Args:
         usuario_id (int): ID del usuario cuya última comida se quiere eliminar.
@@ -321,7 +371,7 @@ def eliminar_ultima_comida(usuario_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 6. REGISTRAR EJERCICIO
+# 7. REGISTRAR EJERCICIO
 # ---------------------------------------------------------------------------
 
 def registrar_ejercicio(
@@ -340,7 +390,7 @@ def registrar_ejercicio(
 
     Args:
         usuario_id        (int):   ID del usuario que realizó el ejercicio.
-        ejercicio         (str):   Nombre del ejercicio (ej: "sentadillas", "correr", "plancha").
+        ejercicio         (str):   Nombre del ejercicio (ej: "sentadillas", "correr").
         series            (int):   Número de series realizadas. 0 si es cardio.
         repeticiones      (int):   Repeticiones por serie. 0 si es cardio.
         duracion_min      (float): Duración en minutos. 0 si es ejercicio de fuerza.
@@ -388,7 +438,7 @@ def registrar_ejercicio(
 
 
 # ---------------------------------------------------------------------------
-# 7. CONSULTAR EJERCICIOS HOY
+# 8. CONSULTAR EJERCICIOS HOY
 # ---------------------------------------------------------------------------
 
 def consultar_ejercicios_hoy(usuario_id: int) -> dict:
@@ -439,7 +489,7 @@ def consultar_ejercicios_hoy(usuario_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 8. CALCULAR BALANCE CALÓRICO
+# 9. CALCULAR BALANCE CALÓRICO
 # ---------------------------------------------------------------------------
 
 def calcular_balance_calorico(usuario_id: int) -> dict:
@@ -448,8 +498,7 @@ def calcular_balance_calorico(usuario_id: int) -> dict:
 
     Un balance positivo indica superávit (útil para ganar músculo o peso).
     Un balance negativo indica déficit (útil para bajar peso).
-    También calcula el TMB (Tasa Metabólica Basal) estimada con la fórmula
-    Mifflin-St Jeor usando los datos del perfil del usuario.
+    También calcula la TMB estimada con la fórmula Mifflin-St Jeor.
 
     Args:
         usuario_id (int): ID del usuario a evaluar.
@@ -457,7 +506,7 @@ def calcular_balance_calorico(usuario_id: int) -> dict:
     Returns:
         dict: {"ok": True, "calorias_consumidas": float, "calorias_quemadas_ejercicio": float,
                "tmb_estimada": float, "balance": float, "interpretacion": str} si fue exitoso.
-              {"ok": False, "error": str} si el usuario no existe o faltan datos de perfil.
+              {"ok": False, "error": str} si el usuario no existe.
     """
     if usuario_id <= 0:
         return {"ok": False, "error": "El ID de usuario debe ser un número positivo."}
@@ -474,16 +523,13 @@ def calcular_balance_calorico(usuario_id: int) -> dict:
             conn.close()
             return {"ok": False, "error": f"No existe ningún usuario con ID {usuario_id}."}
 
-        # TMB con Mifflin-St Jeor (fórmula neutral, sin distinción de sexo)
         tmb = (10 * perfil["peso_kg"]) + (6.25 * perfil["altura_cm"]) - (5 * perfil["edad"])
 
-        # Calorías consumidas hoy
         row_comidas = conn.execute(
             "SELECT COALESCE(SUM(calorias), 0) as total FROM registro_comidas WHERE usuario_id = ? AND fecha = ?",
             (usuario_id, hoy)
         ).fetchone()
 
-        # Calorías quemadas por ejercicio hoy
         row_ejercicios = conn.execute(
             "SELECT COALESCE(SUM(calorias_quemadas), 0) as total FROM registro_ejercicios WHERE usuario_id = ? AND fecha = ?",
             (usuario_id, hoy)
@@ -516,21 +562,17 @@ def calcular_balance_calorico(usuario_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 9. GUARDAR PLAN SEMANAL
+# 10. GUARDAR PLAN SEMANAL
 # ---------------------------------------------------------------------------
 
 def guardar_plan_semanal(usuario_id: int, tipo: str, contenido: str) -> dict:
     """
     Guarda un plan semanal alimentario o de entrenamiento para el usuario.
 
-    Permite al nutriólogo o entrenador (o a la IA) guardar un plan estructurado
-    que el usuario pueda consultar posteriormente.
-
     Args:
         usuario_id (int): ID del usuario al que pertenece el plan.
         tipo       (str): Tipo de plan. Valores válidos: "alimentario", "entrenamiento".
-        contenido  (str): Texto completo del plan semanal (puede incluir días, comidas,
-                          ejercicios, cantidades, etc.).
+        contenido  (str): Texto completo del plan semanal.
 
     Returns:
         dict: {"ok": True, "plan_id": int, "mensaje": str} si fue exitoso.
@@ -570,7 +612,7 @@ def guardar_plan_semanal(usuario_id: int, tipo: str, contenido: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 10. CONSULTAR HISTORIAL
+# 11. CONSULTAR HISTORIAL
 # ---------------------------------------------------------------------------
 
 def consultar_historial(usuario_id: int, dias: int = 7) -> dict:
@@ -578,13 +620,11 @@ def consultar_historial(usuario_id: int, dias: int = 7) -> dict:
     Devuelve un resumen del historial de ingesta y ejercicio de los últimos N días.
 
     Para cada día muestra el total de calorías consumidas, calorías quemadas
-    y el balance resultante. Útil para identificar patrones y hacer seguimiento
-    del progreso del usuario a lo largo de la semana.
+    y el balance resultante.
 
     Args:
         usuario_id (int): ID del usuario a consultar.
-        dias       (int): Número de días hacia atrás a incluir. Por defecto 7.
-                          Máximo permitido: 30 días.
+        dias       (int): Número de días hacia atrás a incluir. Por defecto 7. Máximo 30.
 
     Returns:
         dict: {"ok": True, "usuario_id": int, "dias_consultados": int,

@@ -1,9 +1,16 @@
 timestamp,pregunta,latencia_ms,cumple_100ms
-2026-05-28 23:27:07,	quiero crear un usuario,11555.79,False
-2026-05-28 23:28:18,quiero crear un perfil,1503.83,False
-2026-05-28 23:29:29,que es la hiértrofia,1412.36,False
-2026-05-28 23:30:00,quien gano el mundial del 2022?,761.19,False
-2026-05-28 23:39:20,"||hola, quiero crear usuario",997.30,False
-2026-05-28 23:40:26,mi nombre es angel tengo 21 años de edad mi peso actual son 59 kg y mi objetivo ,4181.77,False
-2026-05-28 23:41:29,"si, mi objetivo es aumentar de masa muscular, mido 1.60 cm",1677.47,False
-2026-05-28 23:43:44,si estoy deacuerdo,11320.45,False
+2026-05-29 13:39:11,¿cuántas calorías tiene una quesadilla de pollo?,1169.18,False
+2026-05-29 13:39:45,¿cuántas calorías tienen las grasas por gramo?,484.62,False
+2026-05-29 13:40:00,quiero registrarme,613.12,False
+2026-05-29 13:43:48,quiero registrarme,1639.41,False
+2026-05-29 13:44:22,"Regístrame como María, 25 años, 60kg, 162cm, bajar peso",1554.48,False
+2026-05-29 13:45:05,"soy Carlos, ¿qué llevo hoy?",959.10,False
+2026-05-29 13:45:36,"Regístrame como María, 30 años, 75kg, 168cm, ganar músculo",1575.86,False
+2026-05-29 13:49:30,consultar datos,638.89,False
+2026-05-29 14:03:31,"soy María, ¿que llevo hoy?",1737.51,False
+2026-05-29 14:03:52,consultar mis progresos,1168.70,False
+2026-05-29 14:04:26,Registra que comí 200g de pollo con 330 calorías,1273.59,False
+2026-05-29 14:04:45,"Espera, me equivoqué, bórralo",1161.41,False
+2026-05-29 14:05:08,Registra que comí 200g de pollo con 330 calorías y 150g de arroz blanco cocido,795.03,False
+2026-05-29 14:09:15,"soy María, quiero registrar comida.",1234.52,False
+2026-05-29 14:09:33,Registra que comí 200g de pollo con 330 calorías,1208.22,False
