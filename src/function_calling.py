@@ -1,19 +1,27 @@
 """
-Motor de Function Calling para FitIA — Fase 2.
+Motor de Function Calling HÍBRIDO para FitIA — Sistema Unificado.
 
-Este módulo es el corazón de la Fase 2. Se encarga de:
-  1. Definir el catálogo de herramientas en el formato que entiende el LLM.
-  2. Enviar la pregunta del usuario al LLM con las herramientas disponibles.
-  3. Interceptar el JSON que genera el LLM cuando decide llamar una función.
-  4. Ejecutar la función local correspondiente con los parámetros recibidos.
-  5. Devolver el resultado al LLM para que genere la respuesta final en lenguaje natural.
-  6. Manejar errores en cada etapa sin contaminar el historial de conversación.
+Este módulo combina:
+  - Function Calling para operaciones de datos (crear usuario, registrar comidas, etc.)
+  - RAG (Retrieval-Augmented Generation) para preguntas de conocimiento sobre nutrición/fitness
+  - Detección automática de modo: el LLM decide cuándo usar herramientas vs conocimiento.
+
+Flujo por turno:
+  1. El mensaje llega al LLM con las herramientas disponibles.
+  2. Si el LLM llama una función → se ejecuta localmente y se devuelve el resultado.
+  3. Si el LLM responde con texto → se devuelve directamente (puede ser RAG si el contexto
+     de documentos fue inyectado en el system prompt, o conocimiento general del modelo).
+
+El error previo ("No tengo información sobre crear perfil...") se corregía porque
+el sistema RAG buscaba en documentos PDF la respuesta a acciones del usuario,
+en lugar de usar function calling. Ahora el mismo agente maneja ambos casos.
 """
 
 import json
 from groq import Groq
+from langchain_chroma import Chroma
 from dotenv import load_dotenv
-from typing import Callable
+from typing import Callable, Optional
 import os
 
 from src.functions import (
@@ -61,15 +69,20 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "crear_usuario",
-            "description": "Registra un nuevo usuario con su perfil de salud y objetivo fitness. Usar cuando el usuario quiere empezar a usar FitIA o crear su perfil.",
+            "description": (
+                "Registra un nuevo perfil de usuario en el sistema FitIA. "
+                "SIEMPRE usar esta función cuando el usuario quiera: crear su perfil, "
+                "registrarse, empezar a usar FitIA, o cuando diga 'quiero crear un usuario/perfil'. "
+                "Pedir nombre, edad, peso, altura y objetivo si no los proporcionó."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "nombre":     {"type": "string",  "description": "Nombre completo del usuario."},
-                    "edad":       {"type": "integer", "description": "Edad en años."},
-                    "peso_kg":    {"type": "number",  "description": "Peso actual en kilogramos."},
-                    "altura_cm":  {"type": "number",  "description": "Altura en centímetros."},
-                    "objetivo":   {"type": "string",  "description": "Meta de salud: 'bajar peso', 'subir peso', 'mantener peso', 'ganar músculo' o 'mejorar resistencia'."}
+                    "nombre":    {"type": "string",  "description": "Nombre completo del usuario."},
+                    "edad":      {"type": "integer", "description": "Edad en años."},
+                    "peso_kg":   {"type": "number",  "description": "Peso actual en kilogramos."},
+                    "altura_cm": {"type": "number",  "description": "Altura en centímetros."},
+                    "objetivo":  {"type": "string",  "description": "Meta: 'bajar peso', 'subir peso', 'mantener peso', 'ganar músculo' o 'mejorar resistencia'."}
                 },
                 "required": ["nombre", "edad", "peso_kg", "altura_cm", "objetivo"]
             }
@@ -93,13 +106,13 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "registrar_comida",
-            "description": "Registra un alimento consumido por el usuario en el log del día actual. Usar cuando el usuario diga que comió algo.",
+            "description": "Registra un alimento consumido en el log del día. Usar cuando el usuario diga que comió algo.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "usuario_id":      {"type": "integer", "description": "ID del usuario."},
-                    "alimento":        {"type": "string",  "description": "Nombre del alimento consumido."},
-                    "cantidad_g":      {"type": "number",  "description": "Cantidad consumida en gramos."},
+                    "alimento":        {"type": "string",  "description": "Nombre del alimento."},
+                    "cantidad_g":      {"type": "number",  "description": "Cantidad en gramos."},
                     "calorias":        {"type": "number",  "description": "Calorías totales de esa porción."},
                     "proteinas_g":     {"type": "number",  "description": "Gramos de proteína. Usar 0 si no se sabe."},
                     "carbohidratos_g": {"type": "number",  "description": "Gramos de carbohidratos. Usar 0 si no se sabe."},
@@ -113,7 +126,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "consultar_calorias_hoy",
-            "description": "Muestra el resumen de calorías y macronutrientes consumidos hoy por el usuario.",
+            "description": "Muestra el resumen de calorías y macronutrientes consumidos hoy.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -127,7 +140,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "eliminar_ultima_comida",
-            "description": "Elimina el último alimento registrado hoy por el usuario. Usar cuando el usuario diga que se equivocó al registrar.",
+            "description": "Elimina el último alimento registrado hoy. Usar cuando el usuario diga que se equivocó.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -141,15 +154,15 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "registrar_ejercicio",
-            "description": "Registra un ejercicio realizado por el usuario hoy. Usar cuando el usuario diga que hizo ejercicio.",
+            "description": "Registra un ejercicio realizado hoy por el usuario.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "usuario_id":        {"type": "integer", "description": "ID del usuario."},
-                    "ejercicio":         {"type": "string",  "description": "Nombre del ejercicio realizado."},
+                    "ejercicio":         {"type": "string",  "description": "Nombre del ejercicio."},
                     "series":            {"type": "integer", "description": "Número de series. Usar 0 para cardio."},
                     "repeticiones":      {"type": "integer", "description": "Repeticiones por serie. Usar 0 para cardio."},
-                    "duracion_min":      {"type": "number",  "description": "Duración en minutos. Usar 0 para ejercicios de fuerza."},
+                    "duracion_min":      {"type": "number",  "description": "Duración en minutos."},
                     "calorias_quemadas": {"type": "number",  "description": "Calorías estimadas quemadas."}
                 },
                 "required": ["usuario_id", "ejercicio"]
@@ -160,7 +173,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "consultar_ejercicios_hoy",
-            "description": "Muestra todos los ejercicios que el usuario registró hoy y el total de calorías quemadas.",
+            "description": "Muestra todos los ejercicios registrados hoy y el total de calorías quemadas.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -174,7 +187,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "calcular_balance_calorico",
-            "description": "Calcula el balance calórico del día: calorías consumidas menos calorías quemadas. También estima la tasa metabólica basal (TMB).",
+            "description": "Calcula el balance calórico del día (ingesta menos gasto) y estima la TMB.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -193,7 +206,7 @@ TOOLS: list[dict] = [
                 "type": "object",
                 "properties": {
                     "usuario_id": {"type": "integer", "description": "ID del usuario."},
-                    "tipo":       {"type": "string",  "description": "Tipo de plan: 'alimentario' o 'entrenamiento'."},
+                    "tipo":       {"type": "string",  "description": "Tipo: 'alimentario' o 'entrenamiento'."},
                     "contenido":  {"type": "string",  "description": "Texto completo del plan semanal."}
                 },
                 "required": ["usuario_id", "tipo", "contenido"]
@@ -204,12 +217,12 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "consultar_historial",
-            "description": "Muestra el resumen de calorías y ejercicio de los últimos N días del usuario.",
+            "description": "Muestra el resumen de calorías y ejercicio de los últimos N días.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "usuario_id": {"type": "integer", "description": "ID del usuario."},
-                    "dias":       {"type": "integer", "description": "Número de días hacia atrás a consultar (1-30). Por defecto 7."}
+                    "dias":       {"type": "integer", "description": "Número de días a consultar (1-30). Por defecto 7."}
                 },
                 "required": ["usuario_id"]
             }
@@ -217,33 +230,61 @@ TOOLS: list[dict] = [
     }
 ]
 
-SYSTEM_PROMPT_FC: str = """Eres FitIA, una asistente experta en nutrición y fitness con acceso a herramientas para registrar y consultar datos del usuario.
 
-REGLAS DE USO DE HERRAMIENTAS:
-- Usa las herramientas siempre que el usuario quiera registrar o consultar datos (comidas, ejercicios, perfil, balance, historial).
-- Si el usuario no te ha dado su ID de usuario y lo necesitas, pregúntaselo antes de llamar cualquier herramienta. NO inventes un ID.
-- Si falta cualquier dato requerido (nombre, peso, alimento, etc.), pregunta al usuario antes de ejecutar la función. NUNCA inventes datos.
-- Cuando una función devuelva un error, explícaselo al usuario de forma amigable y sugiere cómo corregirlo.
-- Para preguntas de conocimiento general sobre nutrición o fitness, responde con tu conocimiento sin usar herramientas.
-- Sé conciso, motivador y claro en tus respuestas."""
+def _build_system_prompt(rag_context: Optional[str] = None) -> str:
+    """
+    Construye el system prompt dinámico del agente híbrido.
+
+    Si se inyecta contexto RAG, lo incluye para responder preguntas de conocimiento.
+    El prompt deja muy claro al LLM cuándo usar herramientas vs conocimiento.
+
+    Args:
+        rag_context: Texto de contexto recuperado de ChromaDB, o None.
+
+    Returns:
+        str: System prompt completo.
+    """
+    base = """Eres FitIA, una asistente experta en nutrición, fitness y bienestar con acceso a herramientas para gestionar datos del usuario.
+
+REGLAS CRÍTICAS:
+1. HERRAMIENTAS: Usa las herramientas (funciones) cuando el usuario quiera:
+   - Crear o consultar su perfil (crear_usuario, obtener_perfil)
+   - Registrar comidas o ejercicios (registrar_comida, registrar_ejercicio)
+   - Ver su progreso del día (consultar_calorias_hoy, consultar_ejercicios_hoy)
+   - Calcular balance calórico (calcular_balance_calorico)
+   - Ver historial o guardar planes (consultar_historial, guardar_plan_semanal)
+
+2. DATOS FALTANTES: Si el usuario pide crear perfil o registrar algo pero no te dio todos los datos requeridos, PÍDELOS antes de llamar la función. NUNCA inventes datos.
+
+3. ID DE USUARIO: Si el usuario no ha mencionado su ID y necesitas uno, pregúntaselo amablemente. No asumas el ID 1 ni ningún otro.
+
+4. PREGUNTAS DE CONOCIMIENTO: Para preguntas sobre nutrición, dietas, ejercicios, salud general (sin necesidad de guardar datos), responde con tu conocimiento experto."""
+
+    if rag_context:
+        base += f"""
+
+CONTEXTO DE DOCUMENTOS ESPECIALIZADOS (úsalo para respuestas de conocimiento):
+{rag_context}
+
+Si la respuesta está en el contexto de arriba, úsalo. Si no está, usa tu conocimiento general de nutrición y fitness."""
+    else:
+        base += "\n\nResponde con tu conocimiento experto en nutrición y fitness cuando no se necesiten herramientas."
+
+    base += "\n\nSé conciso, motivador y claro. Usa un tono amigable como entrenador de confianza."
+
+    return base
 
 
 def dispatch_function(name: str, arguments: dict) -> str:
     """
     Ejecuta la función local correspondiente al nombre recibido del LLM.
 
-    Busca la función en el mapa de funciones disponibles y la llama con los
-    argumentos proporcionados. Captura cualquier excepción para que un error
-    en una función no rompa el flujo de conversación.
-
     Args:
-        name      (str):  Nombre de la función a ejecutar (debe existir en FUNCTIONS_MAP).
-        arguments (dict): Diccionario de parámetros tal como los generó el LLM.
+        name      (str):  Nombre de la función a ejecutar.
+        arguments (dict): Parámetros tal como los generó el LLM.
 
     Returns:
-        str: Resultado de la función serializado como JSON string, listo para
-             enviarse al LLM como tool_result. En caso de error, devuelve un
-             JSON con la clave "error".
+        str: Resultado serializado como JSON string.
     """
     if name not in FUNCTIONS_MAP:
         return json.dumps({"error": f"Función '{name}' no encontrada en el catálogo."})
@@ -257,52 +298,67 @@ def dispatch_function(name: str, arguments: dict) -> str:
         return json.dumps({"error": f"Error inesperado al ejecutar '{name}': {e}"})
 
 
-def create_function_calling_agent() -> Callable[[str], str]:
+def create_hybrid_agent(db: Optional[Chroma] = None) -> Callable[[str], str]:
     """
-    Crea y devuelve el agente de Function Calling con historial de conversación.
+    Crea el agente híbrido FitIA que combina Function Calling y RAG.
 
-    Construye un closure que mantiene el historial del chat en memoria.
-    En cada turno: envía el mensaje al LLM con las herramientas disponibles,
-    intercepta si el LLM decide llamar una función, la ejecuta localmente,
-    y devuelve el resultado al LLM para la respuesta final.
+    Si se pasa una instancia de ChromaDB, el agente recuperará contexto de documentos
+    para enriquecer las respuestas de conocimiento sobre nutrición y fitness.
+    Si no se pasa db, funciona en modo function-calling puro.
+
+    Args:
+        db (Optional[Chroma]): Base de datos vectorial con documentos de fitness/nutrición.
+                               Puede ser None para modo sin RAG.
 
     Returns:
-        Callable[[str], str]: Función `chat(message)` que procesa mensajes del
-            usuario y devuelve respuestas en lenguaje natural.
+        Callable[[str], str]: Función `chat(message)` que procesa mensajes del usuario.
     """
     historial: list[dict] = []
 
     def chat(message: str) -> str:
         """
-        Procesa un mensaje del usuario a través del agente de Function Calling.
+        Procesa un mensaje del usuario a través del agente híbrido.
 
-        Flujo interno:
-          1. Agrega el mensaje al historial.
-          2. Llama al LLM con las herramientas disponibles.
-          3. Si el LLM responde con texto → lo devuelve directamente.
-          4. Si el LLM genera una tool_call → intercepta el JSON, ejecuta
-             la función local, agrega el resultado al historial y vuelve
-             a llamar al LLM para obtener la respuesta final en lenguaje natural.
+        Flujo:
+          1. Si hay db RAG, busca contexto relevante en los documentos.
+          2. Construye el system prompt (con o sin contexto RAG).
+          3. Llama al LLM con las herramientas disponibles.
+          4. Si hay tool_calls → ejecuta funciones → segunda llamada al LLM.
+          5. Devuelve respuesta final en lenguaje natural.
 
         Args:
-            message (str): Mensaje en lenguaje natural del usuario.
+            message (str): Mensaje del usuario.
 
         Returns:
-            str: Respuesta final del LLM en lenguaje natural, o mensaje de
-                 error amigable si algo falla en el proceso.
+            str: Respuesta de FitIA.
         """
         if not message.strip():
             return "Parece que tu mensaje llegó vacío. ¿Puedes escribirlo de nuevo?"
 
+        # --- Paso 1: Recuperar contexto RAG si hay documentos ---
+        rag_context: Optional[str] = None
+        if db is not None:
+            try:
+                docs = db.similarity_search("query: " + message, k=4)
+                if docs:
+                    rag_context = "\n\n".join([doc.page_content for doc in docs])
+            except Exception:
+                # Si falla el RAG, continuar sin contexto (no bloquear al usuario)
+                rag_context = None
+
+        # --- Paso 2: Construir system prompt dinámico ---
+        system_prompt = _build_system_prompt(rag_context)
+
+        # --- Paso 3: Agregar mensaje al historial y llamar al LLM ---
         historial.append({"role": "user", "content": message})
 
-        # --- Primera llamada al LLM ---
         try:
             response = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": SYSTEM_PROMPT_FC}] + historial,
+                messages=[{"role": "system", "content": system_prompt}] + historial,
                 tools=TOOLS,
-                tool_choice="auto"
+                tool_choice="auto",
+                max_tokens=1024,
             )
         except Exception as e:
             historial.pop()  # Revertir para no contaminar el historial
@@ -310,40 +366,45 @@ def create_function_calling_agent() -> Callable[[str], str]:
 
         msg = response.choices[0].message
 
-        # --- El LLM responde con texto directo (sin llamar función) ---
+        # --- Paso 4a: El LLM responde con texto directo (sin función) ---
         if not msg.tool_calls:
             respuesta: str = msg.content or "No tengo una respuesta para eso ahora mismo."
             historial.append({"role": "assistant", "content": respuesta})
             return respuesta
 
-        # --- El LLM decidió llamar una o más funciones ---
-        # Agregar el mensaje del asistente con las tool_calls al historial
-        historial.append({"role": "assistant", "content": msg.content or "", "tool_calls": [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {"name": tc.function.name, "arguments": tc.function.arguments}
-            }
-            for tc in msg.tool_calls
-        ]})
+        # --- Paso 4b: El LLM decidió llamar una o más funciones ---
+        # Serializar tool_calls al historial en formato correcto para Groq
+        historial.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }
+                }
+                for tc in msg.tool_calls
+            ]
+        })
 
-        # Ejecutar cada función y agregar resultados al historial
+        # Ejecutar cada función y agregar resultados
         for tool_call in msg.tool_calls:
             fn_name = tool_call.function.name
             fn_args_raw = tool_call.function.arguments
 
-            print(f"\n🔧 [Function Call interceptado]")
-            print(f"   Función  : {fn_name}")
-            print(f"   Argumentos: {fn_args_raw}")
+            print(f"\n🔧 [Function Call] {fn_name}")
+            print(f"   Args: {fn_args_raw}")
 
             try:
-                fn_args = json.loads(fn_args_raw)
-            except json.JSONDecodeError as e:
+                fn_args = json.loads(fn_args_raw) if fn_args_raw else {}
+            except json.JSONDecodeError:
                 fn_args = {}
-                print(f"   ⚠️  Error al parsear argumentos: {e}")
 
             resultado_str = dispatch_function(fn_name, fn_args)
-            print(f"   Resultado : {resultado_str}")
+            print(f"   Resultado: {resultado_str}")
 
             historial.append({
                 "role": "tool",
@@ -351,19 +412,32 @@ def create_function_calling_agent() -> Callable[[str], str]:
                 "content": resultado_str
             })
 
-        # --- Segunda llamada al LLM con el resultado de las funciones ---
+        # --- Paso 5: Segunda llamada al LLM con resultados de funciones ---
+        # Reconstruir system prompt (puede incluir contexto RAG actualizado)
         try:
             response2 = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": SYSTEM_PROMPT_FC}] + historial,
+                messages=[{"role": "system", "content": system_prompt}] + historial,
                 tools=TOOLS,
-                tool_choice="auto"
+                tool_choice="none",  # En la segunda llamada NO queremos más tool_calls
+                max_tokens=1024,
             )
             respuesta_final: str = response2.choices[0].message.content or "Listo, acción completada."
         except Exception as e:
-            return f"Las funciones se ejecutaron, pero hubo un error al generar la respuesta final. (Detalle: {e})"
+            return f"Las funciones se ejecutaron correctamente, pero hubo un error generando la respuesta final. (Detalle: {e})"
 
         historial.append({"role": "assistant", "content": respuesta_final})
         return respuesta_final
 
     return chat
+
+
+# ---------------------------------------------------------------------------
+# Mantener compatibilidad con main_fc.py (modo sin RAG)
+# ---------------------------------------------------------------------------
+def create_function_calling_agent() -> Callable[[str], str]:
+    """
+    Crea el agente en modo function-calling puro (sin RAG).
+    Wrapper de compatibilidad para main_fc.py existente.
+    """
+    return create_hybrid_agent(db=None)

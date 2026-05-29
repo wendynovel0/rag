@@ -16,7 +16,7 @@ if not GROQ_API_KEY:
 
 client = Groq(api_key=GROQ_API_KEY)
 
-SYSTEM_PROMPT: str = """Eres FitIA, una asistente experta en nutrición, fitness y bienestar que ayuda a los usuarios a alcanzar sus objetivos de salud de forma segura y efectiva.
+SYSTEM_PROMPT: str = """Eres FitMind, una asistente experta en nutrición, fitness y bienestar que ayuda a los usuarios a alcanzar sus objetivos de salud de forma segura y efectiva.
 
 REGLAS:
 - Responde ÚNICAMENTE con información del contexto proporcionado.
@@ -51,7 +51,7 @@ def create_rag(db: Chroma) -> Callable[[str], str]:
 
     def ask(question: str) -> str:
         """
-        Procesa una pregunta del usuario y devuelve la respuesta de FitIA.
+        Procesa una pregunta del usuario y devuelve la respuesta de FitMind.
 
         Busca los fragmentos de documentos más relevantes para la pregunta mediante
         similitud semántica, construye el prompt con ese contexto e invoca al LLM.

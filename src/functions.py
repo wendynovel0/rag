@@ -53,7 +53,7 @@ def crear_usuario(
         dict: {"ok": True, "usuario_id": int, "mensaje": str} si fue exitoso.
               {"ok": False, "error": str} si ocurrió un problema.
     """
-    objetivos_validos = {"bajar peso", "subir peso", "mantener peso", "ganar músculo", "mejorar resistencia"}
+    objetivos_validos = {"bajar peso", "subir peso", "mantener peso", "ganar músculo","aumentar músculo", "subir músculo" "mejorar resistencia"}
     if objetivo.lower() not in objetivos_validos:
         return {"ok": False, "error": f"Objetivo no válido. Opciones: {', '.join(objetivos_validos)}"}
 
